@@ -36,7 +36,9 @@ func (a *SuspendServer) Execute(ctx context.Context, ev core.Event) error {
 		key = ev.Container
 	}
 	if key == "" {
-		return fmt.Errorf("suspend_server: event has no server/container identifier")
+		// Host/VPS threat with no associated server — nothing to suspend.
+		// Skip quietly so this can sit harmlessly in a shared rule.
+		return nil
 	}
 	id, err := a.resolveServerID(ctx, key)
 	if err != nil {

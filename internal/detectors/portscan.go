@@ -46,14 +46,10 @@ func NewPortScanDetector(cfg config.PortScanConfig, d *docker.Client) *PortScanD
 
 func (d *PortScanDetector) Name() string { return "portscan" }
 
-func (d *PortScanDetector) Run(ctx context.Context) ([]core.Event, error) {
-	conns, err := system.ReadConnections()
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
+func (d *PortScanDetector) Run(ctx context.Context, snap *system.Snapshot) ([]core.Event, error) {
+	now := snap.Time
 
-	for _, c := range conns {
+	for _, c := range snap.Conns {
 		if c.PID == 0 || !c.SynSent() {
 			continue
 		}

@@ -1,16 +1,19 @@
 package main
 
-// exampleConfig is the starter configuration written by `protection config init`.
-// It documents every option with security-first defaults.
-const exampleConfig = `# protection — configuration
+// configTemplate is the starter configuration. Tokens of the form __FOO__ are
+// substituted by `protection config init` (and by the interactive installer)
+// via renderConfig. With no flags they fall back to safe defaults.
+const configTemplate = `# protection — configuration
 # Docs: https://github.com/AnAverageBeing/protection
 
 general:
-  scan_interval: 10s        # how often detectors run
+  name: "__NAME__"          # shown in every alert (hostname / IP / "Protection")
+  mode: __MODE__            # server | docker | both
+  scan_interval: 5s         # how often detectors run (CPU/disk sampling cadence)
   cooldown: 5m              # suppress duplicate alerts/actions for the same threat
   log_level: info           # debug | info | warn | error
   log_file: /var/log/protection.log
-  dry_run: true             # IMPORTANT: start in dry-run, watch alerts, then disable
+  dry_run: __DRY_RUN__      # true = detect & alert only; flip to false to enforce
 
 detectors:
   miner:
@@ -33,9 +36,15 @@ detectors:
     enabled: true
     scan_paths:
       - /var/lib/pterodactyl/volumes
-    ratio_threshold: 150     # uncompressed:compressed
-    max_uncompressed: 53687091200  # 50 GiB absolute ceiling
-    scan_interval: 5m
+    ratio_threshold: 150          # uncompressed:compressed
+    max_uncompressed: 53687091200 # 50 GiB absolute ceiling
+    # Event-driven scanning: when a process spikes CPU + disk writes (an active
+    # extraction) we inspect the archive it's reading immediately, instead of
+    # waiting for the periodic sweep.
+    hot_trigger: true
+    hot_cpu_percent: 80
+    hot_write_mbps: 25
+    full_scan_interval: 30m       # slow backstop sweep of scan_paths
   exploit:
     enabled: true
     flag_reverse_shell: true
@@ -44,8 +53,8 @@ detectors:
 
 alerts:
   discord:
-    enabled: false
-    webhook_url: ""
+    enabled: __DISCORD_ENABLED__
+    webhook_url: "__DISCORD_WEBHOOK__"
     username: Protection
     min_severity: medium
   smtp:
@@ -71,30 +80,33 @@ actions:
     enabled: true
     socket: /var/run/docker.sock
   pterodactyl:
-    enabled: false
-    url: https://panel.example.com
-    api_key: ""             # Application API key with server read + suspend
+    enabled: __PTERO_ENABLED__
+    url: "__PTERO_URL__"      # e.g. https://panel.example.com
+    api_key: "__PTERO_KEY__"  # Application API key (server read + suspend)
   file:
     enabled: true
     quarantine_dir: /var/lib/protection/quarantine
 
 # Rules map detected threats to enforcement. Evaluated top-to-bottom; every
 # matching rule contributes its actions. Available actions:
-#   alert, kill_container, stop_container, suspend_server,
+#   alert, neutralize, kill_container, stop_container, suspend_server,
 #   quarantine_file, delete_file, kill_process, log_only
+#
+# 'neutralize' is smart: it kills the container for containerised threats, or
+# the process for bare-VPS host threats — so one rule works everywhere.
 rules:
   - name: miners
     categories: [miner]
     min_severity: high
-    actions: [kill_container, suspend_server, alert]
+    actions: [neutralize, suspend_server, alert]
   - name: ddos
     categories: [ddos]
     min_severity: high
-    actions: [kill_container, suspend_server, alert]
+    actions: [neutralize, suspend_server, alert]
   - name: exploits
     categories: [exploit]
     min_severity: high
-    actions: [kill_container, alert]
+    actions: [neutralize, alert]
   - name: zipbombs
     categories: [zipbomb]
     min_severity: medium

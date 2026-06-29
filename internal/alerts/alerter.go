@@ -19,13 +19,13 @@ type Alerter interface {
 }
 
 // fieldsFor builds the common ordered key/value pairs describing an event,
-// reused by every channel's formatter.
-func fieldsFor(ev core.Event, hostname string) [][2]string {
+// reused by every channel's formatter. `source` is the installation name.
+func fieldsFor(ev core.Event, source string) [][2]string {
 	fields := [][2]string{
+		{"Installation", source},
 		{"Severity", ev.Severity.String()},
 		{"Category", string(ev.Category)},
 		{"Detector", ev.Detector},
-		{"Host", hostname},
 	}
 	if t := ev.Target(); t != "" {
 		fields = append(fields, [2]string{"Target", t})

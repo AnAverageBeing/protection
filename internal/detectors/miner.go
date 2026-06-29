@@ -56,21 +56,18 @@ func NewMinerDetector(cfg config.MinerConfig, d *docker.Client) *MinerDetector {
 
 func (m *MinerDetector) Name() string { return "miner" }
 
-func (m *MinerDetector) Run(ctx context.Context) ([]core.Event, error) {
-	procs, err := system.ListProcesses()
-	if err != nil {
-		return nil, err
-	}
-
-	now := time.Now()
+func (m *MinerDetector) Run(ctx context.Context, snap *system.Snapshot) ([]core.Event, error) {
+	now := snap.Time
 	var events []core.Event
-	seen := make(map[int]bool, len(procs))
+	seen := make(map[int]bool, len(snap.Processes))
 
-	for _, p := range procs {
+	for _, p := range snap.Processes {
 		seen[p.PID] = true
 
 		nameHit := m.matchesSignature(p)
 		cpuHigh, cpuPct := m.trackCPU(p, now)
+		// A deleted-on-disk executable burning CPU is a classic masked miner.
+		masked := cpuHigh && strings.HasSuffix(p.Exe, " (deleted)")
 
 		if !nameHit && !cpuHigh {
 			continue
@@ -93,6 +90,10 @@ func (m *MinerDetector) Run(ctx context.Context) ([]core.Event, error) {
 			ev.Severity = core.SeverityCritical
 			ev.Title = "Cryptocurrency miner running"
 			ev.Description = fmt.Sprintf("Known miner %q is using %.0f%% CPU on %s.", procDisplay(p), cpuPct, ev.Target())
+		case masked:
+			ev.Severity = core.SeverityHigh
+			ev.Title = "Masked process burning CPU"
+			ev.Description = fmt.Sprintf("Process %q runs from a deleted binary at %.0f%% CPU — a common miner evasion technique.", procDisplay(p), cpuPct)
 		case nameHit:
 			ev.Severity = core.SeverityHigh
 			ev.Title = "Known miner binary detected"
@@ -106,29 +107,28 @@ func (m *MinerDetector) Run(ctx context.Context) ([]core.Event, error) {
 		events = append(events, ev)
 	}
 
-	events = append(events, m.checkPoolConnections(ctx, now)...)
+	events = append(events, m.checkPoolConnections(ctx, snap)...)
 
 	m.gc(seen)
 	return events, nil
 }
 
-// matchesSignature checks comm, exe basename and cmdline against known names.
+// matchesSignature checks whether a process is itself a miner. Binary names are
+// matched only against comm and the exe basename (the actual process identity)
+// — NOT against the full command line, because a parent shell or any command
+// that merely references the path would otherwise be flagged. Command-line
+// matching is reserved for miner *argument* fingerprints, which a launcher
+// wouldn't carry legitimately.
 func (m *MinerDetector) matchesSignature(p system.Process) bool {
 	if m.procNames[strings.ToLower(p.Comm)] {
 		return true
 	}
-	exeBase := strings.ToLower(baseName(p.Exe))
-	if m.procNames[exeBase] {
+	if m.procNames[strings.ToLower(baseName(p.Exe))] {
 		return true
 	}
+	// Miner argument fingerprints regardless of binary name.
 	cmd := strings.ToLower(p.Cmdline)
-	for name := range m.procNames {
-		if strings.Contains(cmd, name) {
-			return true
-		}
-	}
-	// Common miner argument fingerprints regardless of binary name.
-	for _, sig := range []string{"--coin", "stratum+tcp", "stratum+ssl", "--donate-level", "randomx", "-o pool", "--algo"} {
+	for _, sig := range []string{"stratum+tcp", "stratum+ssl", "--donate-level", "--coin ", "--randomx", "-o pool.", "--algo ", "--cpu-priority", "--nicehash"} {
 		if strings.Contains(cmd, sig) {
 			return true
 		}
@@ -168,14 +168,11 @@ func (m *MinerDetector) trackCPU(p system.Process, now time.Time) (bool, float64
 }
 
 // checkPoolConnections flags processes connected to known mining-pool ports.
-func (m *MinerDetector) checkPoolConnections(ctx context.Context, now time.Time) []core.Event {
-	conns, err := system.ReadConnections()
-	if err != nil {
-		return nil
-	}
+func (m *MinerDetector) checkPoolConnections(ctx context.Context, snap *system.Snapshot) []core.Event {
+	now := snap.Time
 	var events []core.Event
 	reported := map[int]bool{}
-	for _, c := range conns {
+	for _, c := range snap.Conns {
 		if !c.Established() || c.PID == 0 || reported[c.PID] {
 			continue
 		}

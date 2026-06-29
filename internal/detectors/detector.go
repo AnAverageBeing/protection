@@ -9,14 +9,15 @@ import (
 
 	"protection/internal/core"
 	"protection/internal/docker"
+	"protection/internal/system"
 )
 
 // Detector inspects the system and returns any security events it finds. Run is
-// called on the engine's scan interval and must be non-blocking-ish (it should
-// return within roughly one interval).
+// called on the engine's scan interval with a shared system snapshot (gathered
+// once per tick) and must return within roughly one interval.
 type Detector interface {
 	Name() string
-	Run(ctx context.Context) ([]core.Event, error)
+	Run(ctx context.Context, snap *system.Snapshot) ([]core.Event, error)
 }
 
 // containerResolver caches container-id → metadata lookups so detectors can

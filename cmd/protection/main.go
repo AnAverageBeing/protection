@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"text/tabwriter"
 	"time"
@@ -140,7 +141,10 @@ func cmdScan(args []string) error {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	events := eng.ScanOnce(ctx)
+
+	events := withSpinner("Scanning processes, network, containers and archives", func() []core.Event {
+		return eng.ScanOnce(ctx)
+	})
 
 	if len(events) == 0 {
 		fmt.Println("✓ no threats detected")
@@ -156,6 +160,45 @@ func cmdScan(args []string) error {
 	return nil
 }
 
+// withSpinner animates a braille spinner on stderr while fn runs, so a scan
+// that takes a few seconds gives live feedback. The spinner is suppressed when
+// stderr is not a terminal (e.g. piped to a file).
+func withSpinner[T any](label string, fn func() T) T {
+	done := make(chan struct{})
+	result := make(chan T, 1)
+	go func() { result <- fn(); close(done) }()
+
+	if !isTerminal() {
+		<-done
+		return <-result
+	}
+
+	frames := []rune{'⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'}
+	ticker := time.NewTicker(90 * time.Millisecond)
+	defer ticker.Stop()
+	start := time.Now()
+	i := 0
+	for {
+		select {
+		case <-done:
+			fmt.Fprintf(os.Stderr, "\r\033[K") // clear spinner line
+			return <-result
+		case <-ticker.C:
+			fmt.Fprintf(os.Stderr, "\r\033[36m%c\033[0m %s… \033[90m(%.0fs)\033[0m",
+				frames[i%len(frames)], label, time.Since(start).Seconds())
+			i++
+		}
+	}
+}
+
+func isTerminal() bool {
+	fi, err := os.Stderr.Stat()
+	if err != nil {
+		return false
+	}
+	return fi.Mode()&os.ModeCharDevice != 0
+}
+
 func cmdStatus(args []string) error {
 	path := configPath(args)
 	cfg, err := config.Load(path)
@@ -163,7 +206,8 @@ func cmdStatus(args []string) error {
 		return err
 	}
 	fmt.Printf("config:        %s (ok)\n", path)
-	fmt.Printf("hostname:      %s\n", cfg.General.Hostname)
+	fmt.Printf("installation:  %s\n", cfg.General.Name)
+	fmt.Printf("mode:          %s\n", cfg.General.Mode)
 	fmt.Printf("scan interval: %s\n", cfg.General.ScanInterval)
 	fmt.Printf("dry run:       %v\n", cfg.General.DryRun)
 
@@ -190,12 +234,14 @@ func cmdStatus(args []string) error {
 
 func cmdConfig(args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: protection config <init|check> [path]")
+		return fmt.Errorf("usage: protection config <init|check> [path] [flags]")
 	}
 	sub := args[0]
+	rest := args[1:]
 	path := config.DefaultPath
-	if len(args) > 1 {
-		path = args[1]
+	if len(rest) > 0 && !strings.HasPrefix(rest[0], "--") {
+		path = rest[0]
+		rest = rest[1:]
 	}
 	switch sub {
 	case "init":
@@ -205,8 +251,13 @@ func cmdConfig(args []string) error {
 		if err := os.MkdirAll(dir(path), 0o755); err != nil {
 			return err
 		}
-		if err := os.WriteFile(path, []byte(exampleConfig), 0o640); err != nil {
+		content := renderConfig(parseInitFlags(rest))
+		if err := os.WriteFile(path, []byte(content), 0o640); err != nil {
 			return err
+		}
+		// Validate what we just wrote so a bad flag fails loudly.
+		if _, err := config.Load(path); err != nil {
+			return fmt.Errorf("generated config is invalid: %w", err)
 		}
 		fmt.Printf("wrote starter config to %s\n", path)
 		return nil
@@ -219,6 +270,74 @@ func cmdConfig(args []string) error {
 	default:
 		return fmt.Errorf("unknown config subcommand %q", sub)
 	}
+}
+
+type initFlags struct {
+	name           string
+	mode           string
+	dryRun         string
+	discordWebhook string
+	pteroURL       string
+	pteroKey       string
+}
+
+// parseInitFlags reads --key value pairs for `config init`.
+func parseInitFlags(args []string) initFlags {
+	f := initFlags{}
+	for i := 0; i+1 < len(args); i += 2 {
+		val := args[i+1]
+		switch args[i] {
+		case "--name":
+			f.name = val
+		case "--mode":
+			f.mode = val
+		case "--dry-run":
+			f.dryRun = val
+		case "--discord-webhook":
+			f.discordWebhook = val
+		case "--pterodactyl-url":
+			f.pteroURL = val
+		case "--pterodactyl-key":
+			f.pteroKey = val
+		}
+	}
+	return f
+}
+
+// renderConfig substitutes the template tokens, falling back to safe defaults.
+func renderConfig(f initFlags) string {
+	name := f.name
+	if name == "" {
+		name = config.DisplayName()
+	}
+	mode := f.mode
+	if mode != config.ModeServer && mode != config.ModeDocker && mode != config.ModeBoth {
+		mode = config.ModeBoth
+	}
+	dryRun := "true"
+	if f.dryRun == "false" {
+		dryRun = "false"
+	}
+	discordEnabled := "false"
+	if f.discordWebhook != "" {
+		discordEnabled = "true"
+	}
+	pteroEnabled := "false"
+	if f.pteroURL != "" && f.pteroKey != "" {
+		pteroEnabled = "true"
+	}
+
+	r := strings.NewReplacer(
+		"__NAME__", name,
+		"__MODE__", mode,
+		"__DRY_RUN__", dryRun,
+		"__DISCORD_ENABLED__", discordEnabled,
+		"__DISCORD_WEBHOOK__", f.discordWebhook,
+		"__PTERO_ENABLED__", pteroEnabled,
+		"__PTERO_URL__", f.pteroURL,
+		"__PTERO_KEY__", f.pteroKey,
+	)
+	return r.Replace(configTemplate)
 }
 
 func cmdTestAlert(args []string) error {
@@ -296,15 +415,16 @@ func buildDetectors(cfg *config.Config, d *docker.Client) []detectors.Detector {
 }
 
 func buildAlerters(cfg *config.Config) []alerts.Alerter {
+	name := cfg.General.Name
 	var as []alerts.Alerter
 	if cfg.Alerts.Discord.Enabled {
-		as = append(as, alerts.NewDiscord(cfg.Alerts.Discord, cfg.General.Hostname))
+		as = append(as, alerts.NewDiscord(cfg.Alerts.Discord, name))
 	}
 	if cfg.Alerts.SMTP.Enabled {
-		as = append(as, alerts.NewSMTP(cfg.Alerts.SMTP, cfg.General.Hostname))
+		as = append(as, alerts.NewSMTP(cfg.Alerts.SMTP, name))
 	}
 	if cfg.Alerts.Webhook.Enabled {
-		as = append(as, alerts.NewWebhook(cfg.Alerts.Webhook, cfg.General.Hostname))
+		as = append(as, alerts.NewWebhook(cfg.Alerts.Webhook, name))
 	}
 	return as
 }

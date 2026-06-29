@@ -23,9 +23,22 @@
 curl -fsSL https://raw.githubusercontent.com/AnAverageBeing/protection/main/install.sh | sudo bash
 ```
 
-That downloads the prebuilt static binary for your architecture, installs the
-systemd service, writes a starter config **in safe dry-run mode**, and enables
-the daemon. No Go toolchain, no dependencies. Then:
+The installer downloads the prebuilt static binary for your architecture and
+then **asks a few quick questions** — what to name this installation, what to
+protect (server / docker / both), your Discord webhook, and whether to use
+Pterodactyl auto-suspend. Everything else has a sane default you can tune later
+in the config. It writes the config **in safe dry-run mode** and enables the
+service. No Go toolchain, no dependencies.
+
+```text
+? Name this installation [node-fra-01]:
+? Protect what? (server / docker / both) [both]:
+? Discord webhook URL for alerts (blank to skip):
+? Using Pterodactyl? auto-suspend abusive servers (y/N): y
+? Arm enforcement now? 'no' keeps safe dry-run mode (y/N): N
+```
+
+Then:
 
 ```bash
 sudo nano /etc/protection/config.yaml   # add your Discord webhook / email
@@ -72,10 +85,23 @@ file, kill the process) — driven by a simple, overridable rule set.
 ## 💎 Why it's different
 
 - **Single static binary, zero cgo.** Drop it on any Linux node. The only build dependency is `gopkg.in/yaml.v3`.
-- **No agents inside containers.** It watches from the host via `/proc` and the Docker socket — clients can't see it, disable it, or evade it from inside their container.
+- **No agents inside containers.** It runs on the host and watches all containers from outside, so clients can't see it, disable it, or evade it from inside their container.
 - **Pterodactyl-native.** Maps offending containers and volume files back to the owning server UUID and can suspend the server through the Application API.
-- **Safe by default.** Ships in `dry_run` mode: it detects and alerts but won't enforce until *you* arm it.
+- **Works on bare VPS too.** The smart `neutralize` action kills the *container* for containerised threats and the *process* for host threats — one policy, every host type.
+- **Fast & responsive.** One shared system snapshot per 5s tick (a single `/proc` walk for all detectors), parallel socket→PID resolution with a time budget so a noisy neighbour can never stall detection.
+- **Event-driven, not just polled.** A spike in CPU + disk writes (an active extraction) instantly triggers a targeted zip-bomb check on that exact process — no waiting for the next sweep.
+- **Safe by default.** Ships in `dry_run: true`: it detects and alerts but won't enforce until *you* arm it.
 - **Tunable, not a black box.** Every threshold, signature list and enforcement rule lives in one documented YAML file.
+
+### Modes
+
+Set `general.mode` (or pick it in the installer) to scope what protection acts on:
+
+| Mode | Scope |
+|---|---|
+| `server` | Host/VPS processes only (great for a plain VPS) |
+| `docker` | Containerised threats only (Pterodactyl/Docker nodes) |
+| `both` | Everything (default) |
 
 | Capability | How it's done (pure Go) |
 |---|---|
@@ -111,8 +137,11 @@ scanner binaries.
 
 ### 💣 Zip bomb
 Reads **declared** sizes from archive metadata — never extracts — and flags
-absurd compression ratios or uncompressed totals. Pterodactyl volume paths are
-mapped back to the owning server for suspension/quarantine.
+absurd compression ratios or uncompressed totals. Two ways:
+- **Hot trigger (event-driven):** when a process spikes CPU *and* disk writes — the fingerprint of an active extraction — protection immediately inspects the archive(s) that process has open (via its `/proc/<pid>/fd`) plus its working directory. A bomb is caught mid-unzip in seconds, not after a fixed delay.
+- **Full sweep (backstop):** a slow periodic walk (default 30m) of every scan path catches bombs uploaded but not yet extracted.
+
+Pterodactyl volume paths are mapped back to the owning server for suspension/quarantine.
 
 ### 🐚 Exploit / escape
 - Known exploit/privesc tools (pwnkit, dirtypipe, linpeas, `nsenter`…).
@@ -141,9 +170,10 @@ protection test-alert    # fire a synthetic alert through every enabled channel
 | Action | Effect |
 |---|---|
 | `alert` | Notify all alert channels |
+| `neutralize` | **Smart:** kills the container for containerised threats, else `SIGKILL`s the host process. Used by the default rules so one policy works on Docker nodes and bare VPS alike |
 | `kill_container` | `SIGKILL` the offending container immediately |
 | `stop_container` | Graceful stop (10s grace) |
-| `suspend_server` | Suspend the server via the Pterodactyl Application API |
+| `suspend_server` | Suspend the server via the Pterodactyl Application API (no-op for host threats) |
 | `quarantine_file` | Move the file to quarantine, `chmod 000` (preserves evidence) |
 | `delete_file` | Permanently remove the file |
 | `kill_process` | `SIGKILL` the offending PID (refuses PID ≤ 1) |
@@ -154,9 +184,9 @@ contributes its actions. Default policy:
 
 ```yaml
 rules:
-  - {name: miners,    categories: [miner],    min_severity: high,   actions: [kill_container, suspend_server, alert]}
-  - {name: ddos,      categories: [ddos],     min_severity: high,   actions: [kill_container, suspend_server, alert]}
-  - {name: exploits,  categories: [exploit],  min_severity: high,   actions: [kill_container, alert]}
+  - {name: miners,    categories: [miner],    min_severity: high,   actions: [neutralize, suspend_server, alert]}
+  - {name: ddos,      categories: [ddos],     min_severity: high,   actions: [neutralize, suspend_server, alert]}
+  - {name: exploits,  categories: [exploit],  min_severity: high,   actions: [neutralize, alert]}
   - {name: zipbombs,  categories: [zipbomb],  min_severity: medium, actions: [quarantine_file, alert]}
   - {name: portscans, categories: [portscan], min_severity: medium, actions: [alert]}
   - {name: catch-all, categories: ["*"],      min_severity: low,    actions: [alert]}
@@ -191,7 +221,9 @@ optionally, the Pterodactyl integration.
 
 ```yaml
 general:
-  scan_interval: 10s
+  name: node-fra-01        # shown in every alert
+  mode: both               # server | docker | both
+  scan_interval: 5s
   dry_run: true            # flip to false to arm enforcement
 
 alerts:

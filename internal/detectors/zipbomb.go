@@ -13,41 +13,138 @@ import (
 
 	"protection/internal/config"
 	"protection/internal/core"
+	"protection/internal/system"
 )
 
 // ZipBombDetector inspects archives for decompression-bomb characteristics
 // WITHOUT extracting them: it reads the archive's own size metadata (central
 // directory for zip, ISIZE trailer for gzip) and flags absurd compression
-// ratios or uncompressed totals. This catches both classic nested bombs and
-// modern overlapping/quine bombs, all from header data alone.
+// ratios or uncompressed totals.
+//
+// It works two ways:
+//   - Hot trigger (event-driven): when a process spikes CPU *and* disk writes
+//     — the fingerprint of an active extraction — we immediately inspect the
+//     archive(s) that process has open, plus its working directory. This
+//     catches a bomb mid-unzip in seconds instead of after a fixed delay.
+//   - Full sweep (backstop): a slow periodic walk of every scan path catches
+//     bombs that were uploaded but not yet extracted.
 type ZipBombDetector struct {
 	cfg config.ZipBombConfig
 
-	lastScan time.Time
-	// remember (path → modtime) we have already cleared so re-scans are cheap
-	// and we don't re-alert on the same untouched file every interval.
-	cleared map[string]int64
+	lastFull time.Time
+	cleared  map[string]int64 // path → modtime we've already cleared
+	prev     map[int]extractSample
+}
+
+type extractSample struct {
+	jiffies    uint64
+	writeBytes uint64
+	at         time.Time
 }
 
 // NewZipBombDetector builds a zip-bomb detector from config.
 func NewZipBombDetector(cfg config.ZipBombConfig) *ZipBombDetector {
-	return &ZipBombDetector{cfg: cfg, cleared: map[string]int64{}}
+	return &ZipBombDetector{
+		cfg:     cfg,
+		cleared: map[string]int64{},
+		prev:    map[int]extractSample{},
+	}
 }
 
 func (d *ZipBombDetector) Name() string { return "zipbomb" }
 
-func (d *ZipBombDetector) Run(ctx context.Context) ([]core.Event, error) {
-	// This is filesystem-heavy, so honour an independent, slower cadence.
-	if time.Since(d.lastScan) < d.cfg.ScanInterval {
-		return nil, nil
-	}
-	d.lastScan = time.Now()
+func (d *ZipBombDetector) Run(ctx context.Context, snap *system.Snapshot) ([]core.Event, error) {
+	var events []core.Event
 
+	if d.cfg.HotTrigger != nil && *d.cfg.HotTrigger {
+		events = append(events, d.hotScan(ctx, snap)...)
+	}
+
+	// Slow backstop sweep of every scan path.
+	if time.Since(d.lastFull) >= d.cfg.FullScanInterval {
+		d.lastFull = time.Now()
+		events = append(events, d.fullSweep(ctx)...)
+	}
+	return events, nil
+}
+
+// hotScan finds processes that look like they are actively extracting an
+// archive (high CPU + high disk write rate) and inspects exactly what they have
+// open. This is the "why wait 5 minutes?" path.
+func (d *ZipBombDetector) hotScan(ctx context.Context, snap *system.Snapshot) []core.Event {
+	writeThreshold := d.cfg.HotWriteMBps * 1024 * 1024
+	seen := make(map[int]bool, len(snap.Processes))
+	var events []core.Event
+	reported := map[string]bool{}
+
+	for _, p := range snap.Processes {
+		seen[p.PID] = true
+		cpuPct, writeRate, ok := d.rates(p, snap.Time)
+		if !ok || cpuPct < d.cfg.HotCPUPercent || writeRate < writeThreshold {
+			continue
+		}
+		// This process is hammering CPU and disk — likely decompressing.
+		// Inspect the archives it has open, then its working directory.
+		candidates := archivesAmong(system.ProcessOpenFiles(p.PID))
+		if cwd := system.ProcessCwd(p.PID); cwd != "" {
+			candidates = append(candidates, archivesIn(cwd)...)
+		}
+		for _, path := range candidates {
+			if reported[path] {
+				continue
+			}
+			reported[path] = true
+			info, err := os.Stat(path)
+			if err != nil {
+				continue
+			}
+			if ev := d.inspect(path, info); ev != nil {
+				ev.ContainerID = p.ContainerID
+				ev.PID = p.PID
+				ev.Process = procDisplay(p)
+				ev.AddEvidence("trigger", fmt.Sprintf("active extraction: %.0f%% CPU, %s/s disk write", cpuPct, humanBytes(uint64(writeRate))))
+				events = append(events, *ev)
+			}
+		}
+	}
+	// GC samples for exited pids.
+	for pid := range d.prev {
+		if !seen[pid] {
+			delete(d.prev, pid)
+		}
+	}
+	return events
+}
+
+// rates computes per-core CPU% and disk write bytes/sec for a process from two
+// samples. Returns ok=false until a baseline exists.
+func (d *ZipBombDetector) rates(p system.Process, now time.Time) (cpuPct, writeRate float64, ok bool) {
+	cur := extractSample{jiffies: p.CPUJiffies(), writeBytes: p.WriteBytes, at: now}
+	prev, had := d.prev[p.PID]
+	d.prev[p.PID] = cur
+	if !had || !now.After(prev.at) {
+		return 0, 0, false
+	}
+	elapsed := now.Sub(prev.at).Seconds()
+	if elapsed <= 0 {
+		return 0, 0, false
+	}
+	if cur.jiffies >= prev.jiffies {
+		cpuPct = float64(cur.jiffies-prev.jiffies) / (elapsed * system.ClockTicks) * 100
+	}
+	if cur.writeBytes >= prev.writeBytes {
+		writeRate = float64(cur.writeBytes-prev.writeBytes) / elapsed
+	}
+	return cpuPct, writeRate, true
+}
+
+// fullSweep walks every configured scan path looking for archive bombs.
+func (d *ZipBombDetector) fullSweep(ctx context.Context) []core.Event {
 	var events []core.Event
 	for _, root := range d.cfg.ScanPaths {
 		_ = filepath.WalkDir(root, func(path string, dirent fs.DirEntry, err error) error {
 			if err != nil {
-				return nil // unreadable dir; skip
+				return nil
 			}
 			select {
 			case <-ctx.Done():
@@ -62,7 +159,7 @@ func (d *ZipBombDetector) Run(ctx context.Context) ([]core.Event, error) {
 				return nil
 			}
 			if mt, ok := d.cleared[path]; ok && mt == info.ModTime().UnixNano() {
-				return nil // unchanged since last clean scan
+				return nil
 			}
 			if ev := d.inspect(path, info); ev != nil {
 				events = append(events, *ev)
@@ -72,7 +169,7 @@ func (d *ZipBombDetector) Run(ctx context.Context) ([]core.Event, error) {
 			return nil
 		})
 	}
-	return events, nil
+	return events
 }
 
 func isArchive(path string) bool {
@@ -83,6 +180,32 @@ func isArchive(path string) bool {
 		}
 	}
 	return false
+}
+
+// archivesAmong filters a list of paths down to archives.
+func archivesAmong(paths []string) []string {
+	var out []string
+	for _, p := range paths {
+		if isArchive(p) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+// archivesIn returns archives directly inside dir (non-recursive, fast).
+func archivesIn(dir string) []string {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, e := range entries {
+		if !e.IsDir() && isArchive(e.Name()) {
+			out = append(out, filepath.Join(dir, e.Name()))
+		}
+	}
+	return out
 }
 
 func (d *ZipBombDetector) inspect(path string, info fs.FileInfo) *core.Event {

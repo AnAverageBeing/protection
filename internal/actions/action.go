@@ -37,8 +37,10 @@ func NewRegistry(cfg *config.Config, dockerClient *docker.Client) *Registry {
 		r.register(&QuarantineFile{dir: cfg.Actions.File.QuarantineDir})
 		r.register(&DeleteFile{})
 	}
-	// kill_process needs no backend config.
+	// kill_process and the smart neutralize action need no backend config;
+	// neutralize falls back to process-kill when Docker is unavailable.
 	r.register(&KillProcess{})
+	r.register(&Neutralize{docker: dockerClient})
 
 	if cfg.Actions.Pterodactyl.Enabled {
 		r.register(NewSuspendServer(cfg.Actions.Pterodactyl))

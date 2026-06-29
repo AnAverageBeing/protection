@@ -24,6 +24,8 @@ type Process struct {
 	STime       uint64 // kernel jiffies
 	StartTime   uint64 // jiffies since boot
 	State       string
+	ReadBytes   uint64 // cumulative bytes read (from /proc/pid/io)
+	WriteBytes  uint64 // cumulative bytes written (from /proc/pid/io)
 }
 
 // CPUJiffies returns the total CPU time consumed by the process in jiffies.
@@ -69,7 +71,73 @@ func ReadProcess(pid int) (Process, error) {
 	}
 	p.UID = readUID(filepath.Join(base, "status"))
 	p.ContainerID = readContainerID(filepath.Join(base, "cgroup"))
+	p.ReadBytes, p.WriteBytes = readIO(filepath.Join(base, "io"))
 	return p, nil
+}
+
+// readIO parses cumulative read/write byte counters from /proc/pid/io. This
+// file requires privilege (root or CAP_SYS_PTRACE); on failure we return zeros.
+func readIO(ioPath string) (read, write uint64) {
+	f, err := os.Open(ioPath)
+	if err != nil {
+		return 0, 0
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := sc.Text()
+		switch {
+		case strings.HasPrefix(line, "read_bytes:"):
+			read = parseTrailingUint(line)
+		case strings.HasPrefix(line, "write_bytes:"):
+			write = parseTrailingUint(line)
+		}
+	}
+	return read, write
+}
+
+func parseTrailingUint(line string) uint64 {
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return 0
+	}
+	v, _ := strconv.ParseUint(fields[len(fields)-1], 10, 64)
+	return v
+}
+
+// ProcessCwd resolves a process's current working directory on the host.
+func ProcessCwd(pid int) string {
+	target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "cwd"))
+	if err != nil {
+		return ""
+	}
+	return target
+}
+
+// ProcessOpenFiles returns the regular files a process currently has open,
+// resolved to their host paths via /proc/pid/fd. Used to pinpoint the exact
+// archive an extraction process is reading.
+func ProcessOpenFiles(pid int) []string {
+	fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+	entries, err := os.ReadDir(fdDir)
+	if err != nil {
+		return nil
+	}
+	var files []string
+	for _, e := range entries {
+		target, err := os.Readlink(filepath.Join(fdDir, e.Name()))
+		if err != nil {
+			continue
+		}
+		// Skip sockets, pipes, anon inodes, and deleted files.
+		if !strings.HasPrefix(target, "/") || strings.HasSuffix(target, " (deleted)") {
+			continue
+		}
+		if info, err := os.Stat(target); err == nil && info.Mode().IsRegular() {
+			files = append(files, target)
+		}
+	}
+	return files
 }
 
 func (p *Process) readStat(base string) error {

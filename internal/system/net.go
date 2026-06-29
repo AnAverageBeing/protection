@@ -5,8 +5,11 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 )
 
 // TCP connection states as reported by /proc/net/tcp (hex).
@@ -14,6 +17,10 @@ const (
 	tcpEstablished = "01"
 	tcpSynSent     = "02"
 )
+
+// pidResolveBudget caps how long socket→pid resolution may take per scan, so a
+// pathological process with a huge fd table can't stall the detection loop.
+const pidResolveBudget = 1500 * time.Millisecond
 
 // Conn is one row from /proc/net/tcp{,6}.
 type Conn struct {
@@ -126,8 +133,12 @@ func hexToBytes(s string) ([]byte, error) {
 }
 
 // attachPIDs builds an inode→pid map by walking every process's fd directory
-// and matching "socket:[inode]" symlinks. This is the standard way to map a
-// connection to its owning process without netlink.
+// and matching "socket:[inode]" symlinks — the standard way to map a connection
+// to its owning process without netlink.
+//
+// On busy hosts there can be hundreds of thousands of open fds, and each needs
+// a readlink syscall, so we fan the per-process walk out across a worker pool.
+// This turns a multi-second serial scan into a sub-second parallel one.
 func attachPIDs(conns []Conn) {
 	if len(conns) == 0 {
 		return
@@ -139,49 +150,119 @@ func attachPIDs(conns []Conn) {
 		}
 	}
 
-	type owner struct {
-		pid  int
-		comm string
+	type match struct {
+		inode uint64
+		pid   int
 	}
-	inodeOwner := make(map[uint64]owner)
 
-	procs, _ := os.ReadDir("/proc")
-	for _, e := range procs {
-		if !e.IsDir() {
-			continue
-		}
-		pid, err := strconv.Atoi(e.Name())
-		if err != nil {
-			continue
-		}
-		fdDir := filepath.Join("/proc", e.Name(), "fd")
-		fds, err := os.ReadDir(fdDir)
-		if err != nil {
-			continue
-		}
-		var comm string
-		for _, fd := range fds {
-			link, err := os.Readlink(filepath.Join(fdDir, fd.Name()))
-			if err != nil || !strings.HasPrefix(link, "socket:[") {
-				continue
-			}
-			inodeStr := strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")
-			inode, err := strconv.ParseUint(inodeStr, 10, 64)
-			if err != nil || !want[inode] {
-				continue
-			}
-			if comm == "" {
-				comm = readComm(pid)
-			}
-			inodeOwner[inode] = owner{pid: pid, comm: comm}
+	// Collect candidate pids first.
+	entries, _ := os.ReadDir("/proc")
+	pids := make([]int, 0, len(entries))
+	for _, e := range entries {
+		if pid, err := strconv.Atoi(e.Name()); err == nil {
+			pids = append(pids, pid)
 		}
 	}
 
+	workers := runtime.NumCPU() * 4
+	if workers < 4 {
+		workers = 4
+	}
+	if workers > 64 {
+		workers = 64
+	}
+
+	// A job is a slice of fd paths belonging to one pid. We chunk each process's
+	// fds so that a single process with an enormous fd table (a leak, or an
+	// abuser deliberately holding many sockets) is still split across all
+	// workers instead of pinning one of them.
+	type job struct {
+		pid   int
+		fdDir string
+		names []string
+	}
+	const chunk = 2048
+
+	jobs := make(chan job, workers*2)
+	var mu sync.Mutex
+	inodePID := make(map[uint64]int)
+	var wg sync.WaitGroup
+
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			var local []match
+			for j := range jobs {
+				for _, name := range j.names {
+					link, err := os.Readlink(filepath.Join(j.fdDir, name))
+					if err != nil || !strings.HasPrefix(link, "socket:[") {
+						continue
+					}
+					inodeStr := strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")
+					inode, err := strconv.ParseUint(inodeStr, 10, 64)
+					if err != nil || !want[inode] {
+						continue
+					}
+					local = append(local, match{inode: inode, pid: j.pid})
+				}
+			}
+			if len(local) > 0 {
+				mu.Lock()
+				for _, m := range local {
+					inodePID[m.inode] = m.pid
+				}
+				mu.Unlock()
+			}
+		}()
+	}
+
+	// Bound total resolution time. On a healthy node this never triggers (the
+	// scan finishes in milliseconds); on a host with a pathological
+	// socket-leaking process it prevents one bad neighbour from stalling every
+	// tick. Connections left unresolved simply have PID==0 and are skipped by
+	// pid-level checks (container-level checks are unaffected).
+	deadline := time.Now().Add(pidResolveBudget)
+	go func() {
+		defer close(jobs)
+		for _, pid := range pids {
+			if time.Now().After(deadline) {
+				return
+			}
+			fdDir := filepath.Join("/proc", strconv.Itoa(pid), "fd")
+			ents, err := os.ReadDir(fdDir)
+			if err != nil {
+				continue
+			}
+			names := make([]string, len(ents))
+			for i, e := range ents {
+				names[i] = e.Name()
+			}
+			for i := 0; i < len(names); i += chunk {
+				end := i + chunk
+				if end > len(names) {
+					end = len(names)
+				}
+				jobs <- job{pid: pid, fdDir: fdDir, names: names[i:end]}
+			}
+		}
+	}()
+	wg.Wait()
+
+	// Resolve comm once per owning pid (cheap: at most one per connection).
+	commCache := make(map[int]string)
 	for i := range conns {
-		if o, ok := inodeOwner[conns[i].Inode]; ok {
-			conns[i].PID = o.pid
-			conns[i].Process = o.comm
+		pid, ok := inodePID[conns[i].Inode]
+		if !ok {
+			continue
 		}
+		comm, seen := commCache[pid]
+		if !seen {
+			comm = readComm(pid)
+			commCache[pid] = comm
+		}
+		conns[i].PID = pid
+		conns[i].Process = comm
 	}
 }
 

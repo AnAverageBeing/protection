@@ -15,19 +15,19 @@ import (
 // Webhook POSTs the raw event as JSON to an arbitrary endpoint, letting
 // operators wire protection into their own automation (SIEM, PagerDuty, n8n...).
 type Webhook struct {
-	cfg      config.WebhookConfig
-	hostname string
-	min      core.Severity
-	client   *http.Client
+	cfg    config.WebhookConfig
+	source string // installation name
+	min    core.Severity
+	client *http.Client
 }
 
-// NewWebhook builds a generic webhook alerter.
-func NewWebhook(cfg config.WebhookConfig, hostname string) *Webhook {
+// NewWebhook builds a generic webhook alerter. `source` is the installation name.
+func NewWebhook(cfg config.WebhookConfig, source string) *Webhook {
 	return &Webhook{
-		cfg:      cfg,
-		hostname: hostname,
-		min:      core.ParseSeverity(cfg.MinSeverity),
-		client:   &http.Client{Timeout: 10 * time.Second},
+		cfg:    cfg,
+		source: source,
+		min:    core.ParseSeverity(cfg.MinSeverity),
+		client: &http.Client{Timeout: 10 * time.Second},
 	}
 }
 
@@ -36,8 +36,8 @@ func (w *Webhook) MinSeverity() core.Severity { return w.min }
 
 func (w *Webhook) Send(ctx context.Context, ev core.Event) error {
 	payload := map[string]any{
-		"host":  w.hostname,
-		"event": ev,
+		"installation": w.source,
+		"event":        ev,
 	}
 	body, err := json.Marshal(payload)
 	if err != nil {

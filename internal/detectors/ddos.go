@@ -47,13 +47,11 @@ func NewDDoSDetector(cfg config.DDoSConfig, d *docker.Client) *DDoSDetector {
 
 func (d *DDoSDetector) Name() string { return "ddos" }
 
-func (d *DDoSDetector) Run(ctx context.Context) ([]core.Event, error) {
-	now := time.Now()
+func (d *DDoSDetector) Run(ctx context.Context, snap *system.Snapshot) ([]core.Event, error) {
 	var events []core.Event
-
-	events = append(events, d.checkContainerRates(ctx, now)...)
-	events = append(events, d.checkToolSignatures(ctx, now)...)
-	events = append(events, d.checkConnectionFloods(ctx, now)...)
+	events = append(events, d.checkContainerRates(ctx, snap.Time)...)
+	events = append(events, d.checkToolSignatures(ctx, snap)...)
+	events = append(events, d.checkConnectionFloods(ctx, snap)...)
 	return events, nil
 }
 
@@ -120,13 +118,10 @@ func (d *DDoSDetector) checkContainerRates(ctx context.Context, now time.Time) [
 }
 
 // checkToolSignatures matches running processes against known stress tools.
-func (d *DDoSDetector) checkToolSignatures(ctx context.Context, now time.Time) []core.Event {
-	procs, err := system.ListProcesses()
-	if err != nil {
-		return nil
-	}
+func (d *DDoSDetector) checkToolSignatures(ctx context.Context, snap *system.Snapshot) []core.Event {
+	now := snap.Time
 	var events []core.Event
-	for _, p := range procs {
+	for _, p := range snap.Processes {
 		cmd := strings.ToLower(p.Cmdline)
 		hit := d.tools[strings.ToLower(p.Comm)] || d.tools[strings.ToLower(baseName(p.Exe))]
 		if !hit {
@@ -171,14 +166,11 @@ func (d *DDoSDetector) checkToolSignatures(ctx context.Context, now time.Time) [
 
 // checkConnectionFloods flags processes holding an abnormal number of
 // simultaneous outbound connections.
-func (d *DDoSDetector) checkConnectionFloods(ctx context.Context, now time.Time) []core.Event {
-	conns, err := system.ReadConnections()
-	if err != nil {
-		return nil
-	}
+func (d *DDoSDetector) checkConnectionFloods(ctx context.Context, snap *system.Snapshot) []core.Event {
+	now := snap.Time
 	count := map[int]int{}
 	comm := map[int]string{}
-	for _, c := range conns {
+	for _, c := range snap.Conns {
 		if c.PID == 0 || (!c.Established() && !c.SynSent()) {
 			continue
 		}

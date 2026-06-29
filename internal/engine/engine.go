@@ -16,6 +16,7 @@ import (
 	"protection/internal/core"
 	"protection/internal/detectors"
 	"protection/internal/logging"
+	"protection/internal/system"
 )
 
 // Engine coordinates detection, alerting and enforcement.
@@ -64,22 +65,37 @@ func (e *Engine) Run(ctx context.Context) {
 // ScanOnce runs every detector a single time and returns the findings without
 // taking action. Used by the `scan` CLI command.
 func (e *Engine) ScanOnce(ctx context.Context) []core.Event {
+	snap, err := system.Gather()
+	if err != nil {
+		logging.Error("failed to gather system snapshot: %v", err)
+		return nil
+	}
 	var all []core.Event
 	for _, d := range e.detectors {
-		evs, err := d.Run(ctx)
+		evs, err := d.Run(ctx, snap)
 		if err != nil {
 			logging.Warn("detector %s error: %v", d.Name(), err)
 			continue
 		}
-		all = append(all, evs...)
+		for _, ev := range evs {
+			if e.inScope(ev) {
+				all = append(all, ev)
+			}
+		}
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].Severity > all[j].Severity })
 	return all
 }
 
 func (e *Engine) scan(ctx context.Context) {
+	// One coherent system capture shared by every detector this tick.
+	snap, err := system.Gather()
+	if err != nil {
+		logging.Error("failed to gather system snapshot: %v", err)
+		return
+	}
 	for _, d := range e.detectors {
-		evs, err := d.Run(ctx)
+		evs, err := d.Run(ctx, snap)
 		if err != nil {
 			logging.Warn("detector %s error: %v", d.Name(), err)
 			continue
@@ -90,8 +106,18 @@ func (e *Engine) scan(ctx context.Context) {
 	}
 }
 
+// inScope applies the global protection mode (server|docker|both).
+func (e *Engine) inScope(ev core.Event) bool {
+	containerRelated := ev.ContainerID != "" || ev.Server != ""
+	return config.ModeAllows(e.cfg.General.Mode, containerRelated)
+}
+
 // handle applies cooldown, rule matching, alerting and enforcement to one event.
 func (e *Engine) handle(ctx context.Context, ev core.Event) {
+	if !e.inScope(ev) {
+		logging.Debug("event %s out of scope for mode=%s", ev.Key(), e.cfg.General.Mode)
+		return
+	}
 	if e.inCooldown(ev) {
 		logging.Debug("suppressing duplicate event %s (cooldown)", ev.Key())
 		return

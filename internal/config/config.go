@@ -5,6 +5,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"os"
 	"time"
 
@@ -25,6 +26,12 @@ type Config struct {
 
 // General holds daemon-wide settings.
 type General struct {
+	// Name is the human label for this installation, shown in every alert.
+	// Defaults to the hostname, then the primary IP, then "Protection".
+	Name string `yaml:"name"`
+	// Mode selects what to protect: "server" (host processes only),
+	// "docker" (containerised threats only) or "both".
+	Mode         string        `yaml:"mode"`
 	ScanInterval time.Duration `yaml:"scan_interval"`
 	Cooldown     time.Duration `yaml:"cooldown"`
 	LogLevel     string        `yaml:"log_level"`
@@ -34,6 +41,13 @@ type General struct {
 	DryRun   bool   `yaml:"dry_run"`
 	Hostname string `yaml:"hostname"`
 }
+
+// Protection modes.
+const (
+	ModeServer = "server"
+	ModeDocker = "docker"
+	ModeBoth   = "both"
+)
 
 // DetectorConfigs groups every detector's settings.
 type DetectorConfigs struct {
@@ -74,12 +88,19 @@ type DDoSConfig struct {
 
 // ZipBombConfig tunes archive-bomb detection.
 type ZipBombConfig struct {
-	Enabled         bool          `yaml:"enabled"`
-	ScanPaths       []string      `yaml:"scan_paths"`
-	RatioThreshold  float64       `yaml:"ratio_threshold"`  // uncompressed/compressed
-	MaxUncompressed uint64        `yaml:"max_uncompressed"` // absolute byte ceiling
-	MaxNesting      int           `yaml:"max_nesting"`
-	ScanInterval    time.Duration `yaml:"scan_interval"`
+	Enabled         bool     `yaml:"enabled"`
+	ScanPaths       []string `yaml:"scan_paths"`
+	RatioThreshold  float64  `yaml:"ratio_threshold"`  // uncompressed/compressed
+	MaxUncompressed uint64   `yaml:"max_uncompressed"` // absolute byte ceiling
+	MaxNesting      int      `yaml:"max_nesting"`
+	// FullScanInterval is the slow backstop sweep of every scan path.
+	FullScanInterval time.Duration `yaml:"full_scan_interval"`
+	// HotTrigger enables event-driven scanning: when a process spikes CPU and
+	// disk writes (the signature of an active extraction) we immediately scan
+	// its container/volume instead of waiting for the next full sweep.
+	HotTrigger    *bool   `yaml:"hot_trigger"`     // nil = enabled
+	HotCPUPercent float64 `yaml:"hot_cpu_percent"` // per-core CPU to consider "extracting"
+	HotWriteMBps  float64 `yaml:"hot_write_mbps"`  // disk write rate to consider "extracting"
 }
 
 // ExploitConfig tunes exploit / container-escape detection.
@@ -182,7 +203,11 @@ func Load(path string) (*Config, error) {
 
 func (c *Config) applyDefaults() {
 	if c.General.ScanInterval <= 0 {
-		c.General.ScanInterval = 10 * time.Second
+		// 5s gives responsive CPU/disk sampling without hammering /proc.
+		c.General.ScanInterval = 5 * time.Second
+	}
+	if c.General.Mode == "" {
+		c.General.Mode = ModeBoth
 	}
 	if c.General.Cooldown <= 0 {
 		c.General.Cooldown = 5 * time.Minute
@@ -194,6 +219,9 @@ func (c *Config) applyDefaults() {
 		if h, err := os.Hostname(); err == nil {
 			c.General.Hostname = h
 		}
+	}
+	if c.General.Name == "" {
+		c.General.Name = DisplayName()
 	}
 
 	if len(c.Detectors.Miner.KnownProcesses) == 0 {
@@ -250,8 +278,18 @@ func (c *Config) applyDefaults() {
 	if c.Detectors.ZipBomb.MaxNesting == 0 {
 		c.Detectors.ZipBomb.MaxNesting = 3
 	}
-	if c.Detectors.ZipBomb.ScanInterval <= 0 {
-		c.Detectors.ZipBomb.ScanInterval = 5 * time.Minute
+	if c.Detectors.ZipBomb.FullScanInterval <= 0 {
+		c.Detectors.ZipBomb.FullScanInterval = 30 * time.Minute
+	}
+	if c.Detectors.ZipBomb.HotCPUPercent == 0 {
+		c.Detectors.ZipBomb.HotCPUPercent = 80
+	}
+	if c.Detectors.ZipBomb.HotWriteMBps == 0 {
+		c.Detectors.ZipBomb.HotWriteMBps = 25
+	}
+	if c.Detectors.ZipBomb.HotTrigger == nil {
+		enabled := true
+		c.Detectors.ZipBomb.HotTrigger = &enabled
 	}
 
 	if len(c.Detectors.Exploit.SuspiciousProcs) == 0 {
@@ -277,6 +315,11 @@ func (c *Config) applyDefaults() {
 }
 
 func (c *Config) validate() error {
+	switch c.General.Mode {
+	case ModeServer, ModeDocker, ModeBoth:
+	default:
+		return fmt.Errorf("general.mode must be one of server|docker|both, got %q", c.General.Mode)
+	}
 	if c.Alerts.SMTP.Enabled {
 		if c.Alerts.SMTP.Host == "" || len(c.Alerts.SMTP.To) == 0 {
 			return fmt.Errorf("smtp alert enabled but host/to not set")
@@ -297,15 +340,56 @@ func (c *Config) validate() error {
 }
 
 // DefaultRules returns the built-in enforcement policy: aggressive on the
-// unambiguous threats, alert-only on the noisier heuristics.
+// unambiguous threats, alert-only on the noisier heuristics. The `neutralize`
+// action auto-selects container-kill or process-kill based on the threat, so a
+// single rule works on both Pterodactyl/Docker nodes and bare VPS hosts.
 func DefaultRules() []Rule {
 	return []Rule{
-		{Name: "miners", Categories: []string{"miner"}, MinSeverity: "high", Actions: []string{"kill_container", "suspend_server", "alert"}},
-		{Name: "ddos", Categories: []string{"ddos"}, MinSeverity: "high", Actions: []string{"kill_container", "suspend_server", "alert"}},
-		{Name: "exploits", Categories: []string{"exploit"}, MinSeverity: "high", Actions: []string{"kill_container", "alert"}},
+		{Name: "miners", Categories: []string{"miner"}, MinSeverity: "high", Actions: []string{"neutralize", "suspend_server", "alert"}},
+		{Name: "ddos", Categories: []string{"ddos"}, MinSeverity: "high", Actions: []string{"neutralize", "suspend_server", "alert"}},
+		{Name: "exploits", Categories: []string{"exploit"}, MinSeverity: "high", Actions: []string{"neutralize", "alert"}},
 		{Name: "zipbombs", Categories: []string{"zipbomb"}, MinSeverity: "medium", Actions: []string{"quarantine_file", "alert"}},
 		{Name: "portscans", Categories: []string{"portscan"}, MinSeverity: "medium", Actions: []string{"alert"}},
 		{Name: "catch-all", Categories: []string{"*"}, MinSeverity: "low", Actions: []string{"alert"}},
+	}
+}
+
+// DisplayName picks the best default installation label: hostname, else the
+// primary outbound IP, else "Protection".
+func DisplayName() string {
+	if h, err := os.Hostname(); err == nil && h != "" {
+		return h
+	}
+	if ip := primaryIP(); ip != "" {
+		return ip
+	}
+	return "Protection"
+}
+
+func primaryIP() string {
+	// No traffic is sent; this just selects the kernel's preferred source IP.
+	conn, err := net.Dial("udp", "1.1.1.1:80")
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if a, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return a.IP.String()
+	}
+	return ""
+}
+
+// ModeAllows reports whether an event is in scope for the configured mode.
+// Container-related events (have a container id or pterodactyl server) belong
+// to "docker"; everything else is host/"server" scope.
+func ModeAllows(mode string, containerRelated bool) bool {
+	switch mode {
+	case ModeDocker:
+		return containerRelated
+	case ModeServer:
+		return !containerRelated
+	default:
+		return true
 	}
 }
 

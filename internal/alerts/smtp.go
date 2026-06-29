@@ -14,14 +14,14 @@ import (
 // SMTP sends plain-text email alerts. It supports both implicit TLS (port 465)
 // and STARTTLS (port 587), as well as unauthenticated relays.
 type SMTP struct {
-	cfg      config.SMTPConfig
-	hostname string
-	min      core.Severity
+	cfg    config.SMTPConfig
+	source string // installation name
+	min    core.Severity
 }
 
-// NewSMTP builds an email alerter.
-func NewSMTP(cfg config.SMTPConfig, hostname string) *SMTP {
-	return &SMTP{cfg: cfg, hostname: hostname, min: core.ParseSeverity(cfg.MinSeverity)}
+// NewSMTP builds an email alerter. `source` is the installation name.
+func NewSMTP(cfg config.SMTPConfig, source string) *SMTP {
+	return &SMTP{cfg: cfg, source: source, min: core.ParseSeverity(cfg.MinSeverity)}
 }
 
 func (s *SMTP) Name() string               { return "smtp" }
@@ -80,7 +80,7 @@ func (s *SMTP) sendImplicitTLS(addr string, auth smtp.Auth, msg []byte) error {
 
 func (s *SMTP) buildMessage(ev core.Event) []byte {
 	var b strings.Builder
-	subject := fmt.Sprintf("[protection][%s] %s on %s", strings.ToUpper(ev.Severity.String()), ev.Title, s.hostname)
+	subject := fmt.Sprintf("[protection][%s] %s on %s", strings.ToUpper(ev.Severity.String()), ev.Title, s.source)
 	fmt.Fprintf(&b, "From: %s\r\n", s.cfg.From)
 	fmt.Fprintf(&b, "To: %s\r\n", strings.Join(s.cfg.To, ", "))
 	fmt.Fprintf(&b, "Subject: %s\r\n", subject)
@@ -88,7 +88,7 @@ func (s *SMTP) buildMessage(ev core.Event) []byte {
 	b.WriteString("Content-Type: text/plain; charset=UTF-8\r\n\r\n")
 
 	fmt.Fprintf(&b, "%s\n\n", ev.Description)
-	for _, kv := range fieldsFor(ev, s.hostname) {
+	for _, kv := range fieldsFor(ev, s.source) {
 		fmt.Fprintf(&b, "%-12s: %s\n", kv[0], kv[1])
 	}
 	if len(ev.Evidence) > 0 {
