@@ -1,0 +1,33 @@
+[Unit]
+Description=protection — container-host abuse protection daemon
+Documentation=https://github.com/AnAverageBeing/protection
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/protection run --config /etc/protection/config.yaml
+Restart=on-failure
+RestartSec=5
+
+# protection needs to read every process in /proc, inspect network state and
+# talk to the Docker socket, so it runs as root. We still drop everything it
+# does not need.
+User=root
+AmbientCapabilities=CAP_SYS_PTRACE CAP_KILL CAP_DAC_READ_SEARCH
+NoNewPrivileges=false
+
+# Hardening: the daemon only writes to its own state/log dirs.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/protection /var/log /var/lib/pterodactyl/volumes
+ProtectHome=read-only
+PrivateTmp=false
+StateDirectory=protection
+LogsDirectory=protection
+
+# Resource guardrails so the watchdog can never become the problem.
+MemoryMax=256M
+CPUQuota=50%
+
+[Install]
+WantedBy=multi-user.target

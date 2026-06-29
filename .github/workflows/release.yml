@@ -1,0 +1,49 @@
+name: release
+
+# Build static binaries for linux/amd64 and linux/arm64 and attach them to the
+# GitHub Release whenever a version tag (vX.Y.Z) is pushed.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        arch: [amd64, arm64]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Build
+        env:
+          CGO_ENABLED: "0"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          go build -trimpath -ldflags "-s -w -X main.Version=${VERSION}" \
+            -o "protection-linux-${{ matrix.arch }}" ./cmd/protection
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: protection-linux-${{ matrix.arch }}
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+      - run: go vet ./...
+      - run: go test ./...
