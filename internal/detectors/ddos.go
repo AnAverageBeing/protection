@@ -170,17 +170,25 @@ func (d *DDoSDetector) checkConnectionFloods(ctx context.Context, snap *system.S
 	now := snap.Time
 	count := map[int]int{}
 	comm := map[int]string{}
+	container := map[int]string{}
 	for _, c := range snap.Conns {
 		if c.PID == 0 || (!c.Established() && !c.SynSent()) {
 			continue
 		}
 		count[c.PID]++
 		comm[c.PID] = c.Process
+		if c.ContainerID != "" {
+			container[c.PID] = c.ContainerID
+		}
 	}
 	var events []core.Event
 	for pid, n := range count {
 		if n < d.cfg.ConnThreshold {
 			continue
+		}
+		containerID := container[pid]
+		if containerID == "" {
+			containerID = system.ContainerIDForPID(pid)
 		}
 		ev := core.Event{
 			Time:        now,
@@ -190,7 +198,7 @@ func (d *DDoSDetector) checkConnectionFloods(ctx context.Context, snap *system.S
 			Title:       "Connection flood",
 			PID:         pid,
 			Process:     comm[pid],
-			ContainerID: system.ContainerIDForPID(pid),
+			ContainerID: containerID,
 			Description: fmt.Sprintf("Process %q (pid %d) holds %d simultaneous outbound connections.", comm[pid], pid, n),
 		}
 		ev.AddEvidence("connections", fmt.Sprintf("%d", n))

@@ -86,6 +86,7 @@ file, kill the process) — driven by a simple, overridable rule set.
 
 - **Single static binary, zero cgo.** Drop it on any Linux node. The only build dependency is `gopkg.in/yaml.v3`.
 - **No agents inside containers.** It runs on the host and watches all containers from outside, so clients can't see it, disable it, or evade it from inside their container.
+- **Full container network visibility.** Containers have their own network namespace, so their sockets never appear in the host's connection table. protection reads each container's namespace directly (`/proc/<pid>/net/tcp`), so a miner phoning home to a pool or a port scan launched *from inside a container* is seen and attributed to that container — for free, with no fd-scan cost.
 - **Pterodactyl-native.** Maps offending containers and volume files back to the owning server UUID and can suspend the server through the Application API.
 - **Works on bare VPS too.** The smart `neutralize` action kills the *container* for containerised threats and the *process* for host threats — one policy, every host type.
 - **Fast & responsive.** One shared system snapshot per 5s tick (a single `/proc` walk for all detectors), parallel socket→PID resolution with a time budget so a noisy neighbour can never stall detection.
@@ -107,8 +108,8 @@ Set `general.mode` (or pick it in the installer) to scope what protection acts o
 |---|---|
 | Process inspection | `/proc/<pid>/{stat,cmdline,exe,status,cgroup}` |
 | CPU usage | jiffy sampling across scan intervals |
-| Network connections | `/proc/net/tcp{,6}` + socket-inode → PID via `/proc/<pid>/fd` |
-| Container attribution | 64-hex container id from `/proc/<pid>/cgroup` |
+| Network connections | host `/proc/net/tcp{,6}` **+ every container's namespace** via `/proc/<pid>/net/tcp`; socket-inode → PID via `/proc/<pid>/fd` |
+| Container attribution | network namespace inode + 64-hex container id from `/proc/<pid>/cgroup` |
 | Container egress rates | Docker Engine API `stats` over the unix socket |
 | Archive bombs | `archive/zip` central directory + gzip ISIZE trailer |
 
@@ -205,7 +206,8 @@ A `cooldown` (default 5m) suppresses duplicate alerts/actions for the same threa
 | `protection status` | Show config, enabled detectors/alerts, Docker connectivity |
 | `protection config init [path]` | Write a documented starter config |
 | `protection config check [path]` | Validate a config file |
-| `protection test-alert` | Send a synthetic alert through every enabled channel |
+| `test-alert` | Send a synthetic alert through every enabled channel |
+| `debug-conns [port]` | List every connection protection sees (host + all container namespaces) with owning pid/container — great for verifying visibility |
 | `protection version` | Print version |
 
 Global flag: `--config <path>` (default `/etc/protection/config.yaml`).

@@ -19,6 +19,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -32,6 +33,7 @@ import (
 	"protection/internal/docker"
 	"protection/internal/engine"
 	"protection/internal/logging"
+	"protection/internal/system"
 )
 
 // Version is overridden at build time via -ldflags "-X main.Version=...".
@@ -58,6 +60,8 @@ func main() {
 		err = cmdConfig(args)
 	case "test-alert":
 		err = cmdTestAlert(args)
+	case "debug-conns":
+		err = cmdDebugConns(args)
 	case "version", "-v", "--version":
 		fmt.Printf("protection %s\n", Version)
 	case "help", "-h", "--help":
@@ -87,6 +91,7 @@ COMMANDS:
   config init [path]   Write a starter configuration file
   config check [path]  Validate a configuration file
   test-alert           Send a synthetic alert through every configured channel
+  debug-conns [port]   List all connections seen (host + every container)
   version              Print version
 
 FLAGS:
@@ -197,6 +202,47 @@ func isTerminal() bool {
 		return false
 	}
 	return fi.Mode()&os.ModeCharDevice != 0
+}
+
+// cmdDebugConns dumps every TCP connection protection can see (host + every
+// container namespace), with owning pid and container. Handy for verifying
+// visibility and tuning. Optional first arg filters by remote port.
+func cmdDebugConns(args []string) error {
+	portFilter := -1
+	for _, a := range args {
+		if !strings.HasPrefix(a, "--") {
+			if p, err := strconv.Atoi(a); err == nil {
+				portFilter = p
+			}
+		}
+	}
+	snap, err := system.Gather()
+	if err != nil {
+		return err
+	}
+	w := tabwriter.NewWriter(os.Stdout, 0, 2, 2, ' ', 0)
+	fmt.Fprintln(w, "STATE\tLOCAL\tREMOTE\tPID\tPROCESS\tCONTAINER")
+	n := 0
+	for _, c := range snap.Conns {
+		if portFilter >= 0 && c.RemotePort != portFilter {
+			continue
+		}
+		state := c.State
+		if c.Established() {
+			state = "ESTAB"
+		} else if c.SynSent() {
+			state = "SYN_SENT"
+		}
+		cid := c.ContainerID
+		if len(cid) > 12 {
+			cid = cid[:12]
+		}
+		fmt.Fprintf(w, "%s\t%s:%d\t%s:%d\t%d\t%s\t%s\n", state, c.LocalIP, c.LocalPort, c.RemoteIP, c.RemotePort, c.PID, c.Process, cid)
+		n++
+	}
+	w.Flush()
+	fmt.Printf("\n%d connection(s)\n", n)
+	return nil
 }
 
 func cmdStatus(args []string) error {

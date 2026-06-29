@@ -24,14 +24,16 @@ const pidResolveBudget = 1500 * time.Millisecond
 
 // Conn is one row from /proc/net/tcp{,6}.
 type Conn struct {
-	LocalIP    net.IP
-	LocalPort  int
-	RemoteIP   net.IP
-	RemotePort int
-	State      string
-	Inode      uint64
-	PID        int    // resolved lazily via inode→fd mapping
-	Process    string // comm of owning pid
+	LocalIP     net.IP
+	LocalPort   int
+	RemoteIP    net.IP
+	RemotePort  int
+	State       string
+	Inode       uint64
+	PID         int    // owning pid (resolved via inode→fd mapping)
+	Process     string // comm of owning pid
+	ContainerID string // container the connection belongs to, if any
+	Netns       uint64 // network-namespace inode this connection was read from
 }
 
 // Established reports whether the connection is in the ESTABLISHED state.
@@ -40,18 +42,133 @@ func (c Conn) Established() bool { return c.State == tcpEstablished }
 // SynSent reports whether the connection is mid-handshake (typical of scans).
 func (c Conn) SynSent() bool { return c.State == tcpSynSent }
 
-// ReadConnections parses both IPv4 and IPv6 TCP tables and attaches owning PIDs.
+// ReadConnections is a convenience wrapper that gathers connections across the
+// host and every container network namespace. Most callers use the snapshot's
+// pre-gathered Conns instead.
 func ReadConnections() ([]Conn, error) {
+	procs, err := ListProcesses()
+	if err != nil {
+		return nil, err
+	}
+	return GatherConnections(procs), nil
+}
+
+// GatherConnections returns every TCP connection visible on the host PLUS every
+// container's connections, attributed to the owning container.
+//
+// Docker/containerd give each container its own network namespace, so container
+// sockets do NOT appear in the host's /proc/net/tcp. To see them we read
+// /proc/<pid>/net/tcp through a process living in each namespace. As a bonus,
+// connections read from a container's namespace are attributed to that
+// container for free, and we only need to scan that container's (few) processes
+// to map a socket to its exact pid — no expensive host-wide fd walk.
+func GatherConnections(procs []Process) []Conn {
+	hostNS := netnsInode(1)
+	if hostNS == 0 {
+		hostNS = netnsInode(os.Getpid())
+	}
+
+	pidToContainer := make(map[int]string, len(procs))
+	for i := range procs {
+		pidToContainer[procs[i].PID] = procs[i].ContainerID
+	}
+
+	// Bucket processes into the host namespace and per-container namespaces.
+	var hostPids []int
+	type nsGroup struct {
+		rep         int
+		pids        []int
+		containerID string
+	}
+	groups := map[uint64]*nsGroup{}
+	for i := range procs {
+		p := &procs[i]
+		ns := netnsInode(p.PID)
+		if ns == 0 || ns == hostNS {
+			// host, or namespace unreadable (treat as host, best-effort)
+			hostPids = append(hostPids, p.PID)
+			continue
+		}
+		g := groups[ns]
+		if g == nil {
+			g = &nsGroup{}
+			groups[ns] = g
+		}
+		g.pids = append(g.pids, p.PID)
+		if g.rep == 0 || p.PID < g.rep {
+			g.rep = p.PID
+		}
+		if g.containerID == "" && p.ContainerID != "" {
+			g.containerID = p.ContainerID
+		}
+	}
+
+	var all []Conn
+
+	// Host namespace.
+	hostConns := readNetTCP("/proc/net/tcp", "/proc/net/tcp6")
+	attachPIDs(hostConns, hostPids)
+	for i := range hostConns {
+		hostConns[i].Netns = hostNS
+		if cid := pidToContainer[hostConns[i].PID]; cid != "" {
+			// host-network-mode container
+			hostConns[i].ContainerID = cid
+		}
+	}
+	all = append(all, hostConns...)
+
+	// Each container namespace, via its representative process.
+	for ns, g := range groups {
+		rep := strconv.Itoa(g.rep)
+		conns := readNetTCP("/proc/"+rep+"/net/tcp", "/proc/"+rep+"/net/tcp6")
+		if len(conns) == 0 {
+			continue
+		}
+		attachPIDs(conns, g.pids) // cheap: only this container's processes
+		for i := range conns {
+			conns[i].Netns = ns
+			if conns[i].PID == 0 {
+				conns[i].PID = g.rep // fall back to the container's main process
+			}
+			if cid := pidToContainer[conns[i].PID]; cid != "" {
+				conns[i].ContainerID = cid
+			} else {
+				conns[i].ContainerID = g.containerID
+			}
+		}
+		all = append(all, conns...)
+	}
+	return all
+}
+
+// readNetTCP parses one or more /proc[/<pid>]/net/tcp{,6} tables.
+func readNetTCP(paths ...string) []Conn {
 	var conns []Conn
-	for _, path := range []string{"/proc/net/tcp", "/proc/net/tcp6"} {
+	for _, path := range paths {
 		c, err := parseProcNetTCP(path)
 		if err != nil {
-			continue // tcp6 may be absent on IPv4-only hosts
+			continue
 		}
 		conns = append(conns, c...)
 	}
-	attachPIDs(conns)
-	return conns, nil
+	return conns
+}
+
+// netnsInode returns the network-namespace inode for a pid, or 0 if it can't be
+// read (e.g. insufficient privilege for another user's process).
+func netnsInode(pid int) uint64 {
+	target, err := os.Readlink(filepath.Join("/proc", strconv.Itoa(pid), "ns", "net"))
+	if err != nil {
+		return 0
+	}
+	// format: "net:[4026531840]"
+	open := strings.IndexByte(target, '[')
+	close := strings.IndexByte(target, ']')
+	if open < 0 || close <= open {
+		return 0
+	}
+	v, _ := strconv.ParseUint(target[open+1:close], 10, 64)
+	return v
 }
 
 func parseProcNetTCP(path string) ([]Conn, error) {
@@ -139,8 +256,8 @@ func hexToBytes(s string) ([]byte, error) {
 // On busy hosts there can be hundreds of thousands of open fds, and each needs
 // a readlink syscall, so we fan the per-process walk out across a worker pool.
 // This turns a multi-second serial scan into a sub-second parallel one.
-func attachPIDs(conns []Conn) {
-	if len(conns) == 0 {
+func attachPIDs(conns []Conn, pids []int) {
+	if len(conns) == 0 || len(pids) == 0 {
 		return
 	}
 	want := make(map[uint64]bool, len(conns))
@@ -153,15 +270,6 @@ func attachPIDs(conns []Conn) {
 	type match struct {
 		inode uint64
 		pid   int
-	}
-
-	// Collect candidate pids first.
-	entries, _ := os.ReadDir("/proc")
-	pids := make([]int, 0, len(entries))
-	for _, e := range entries {
-		if pid, err := strconv.Atoi(e.Name()); err == nil {
-			pids = append(pids, pid)
-		}
 	}
 
 	workers := runtime.NumCPU() * 4

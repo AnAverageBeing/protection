@@ -25,9 +25,10 @@ type PortScanDetector struct {
 }
 
 type scanState struct {
-	comm  string
-	ports map[int]time.Time
-	hosts map[string]time.Time
+	comm        string
+	containerID string
+	ports       map[int]time.Time
+	hosts       map[string]time.Time
 }
 
 // NewPortScanDetector builds a port-scan detector from config.
@@ -55,8 +56,11 @@ func (d *PortScanDetector) Run(ctx context.Context, snap *system.Snapshot) ([]co
 		}
 		st := d.state[c.PID]
 		if st == nil {
-			st = &scanState{comm: c.Process, ports: map[int]time.Time{}, hosts: map[string]time.Time{}}
+			st = &scanState{comm: c.Process, containerID: c.ContainerID, ports: map[int]time.Time{}, hosts: map[string]time.Time{}}
 			d.state[c.PID] = st
+		}
+		if st.containerID == "" {
+			st.containerID = c.ContainerID
 		}
 		st.ports[c.RemotePort] = now
 		if c.RemoteIP != nil {
@@ -87,6 +91,10 @@ func (d *PortScanDetector) Run(ctx context.Context, snap *system.Snapshot) ([]co
 			title = "Network scanner running"
 		}
 
+		containerID := st.containerID
+		if containerID == "" {
+			containerID = system.ContainerIDForPID(pid)
+		}
 		ev := core.Event{
 			Time:        now,
 			Detector:    d.Name(),
@@ -95,7 +103,7 @@ func (d *PortScanDetector) Run(ctx context.Context, snap *system.Snapshot) ([]co
 			Title:       title,
 			PID:         pid,
 			Process:     st.comm,
-			ContainerID: system.ContainerIDForPID(pid),
+			ContainerID: containerID,
 			Description: fmt.Sprintf("Process %q (pid %d) opened %d half-open connections across %d ports / %d hosts within %s.",
 				st.comm, pid, distinctPorts+distinctHosts, distinctPorts, distinctHosts, d.cfg.Window),
 		}

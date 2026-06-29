@@ -180,16 +180,24 @@ func (m *MinerDetector) checkPoolConnections(ctx context.Context, snap *system.S
 			continue
 		}
 		reported[c.PID] = true
+		containerID := c.ContainerID
+		if containerID == "" {
+			containerID = system.ContainerIDForPID(c.PID)
+		}
+		where := "on the host"
+		if containerID != "" {
+			where = "inside a container"
+		}
 		ev := core.Event{
 			Time:        now,
 			Detector:    m.Name(),
 			Category:    core.CategoryMiner,
 			Severity:    core.SeverityHigh,
 			Title:       "Connection to mining pool port",
-			Description: fmt.Sprintf("Process %q (pid %d) is connected to %s:%d, a common mining-pool port.", c.Process, c.PID, c.RemoteIP, c.RemotePort),
+			Description: fmt.Sprintf("Process %q (pid %d) %s is connected to %s:%d, a common mining-pool port.", c.Process, c.PID, where, c.RemoteIP, c.RemotePort),
 			PID:         c.PID,
 			Process:     c.Process,
-			ContainerID: system.ContainerIDForPID(c.PID),
+			ContainerID: containerID,
 		}
 		ev.AddEvidence("remote", fmt.Sprintf("%s:%d", c.RemoteIP, c.RemotePort))
 		m.resolver.resolve(ctx, &ev)

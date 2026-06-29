@@ -23,7 +23,8 @@ func Gather() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	conns, _ := ReadConnections() // best-effort; empty on permission errors
+	// Gathers host + per-container connections, reusing the process list.
+	conns := GatherConnections(procs)
 
 	s := &Snapshot{
 		Time:      time.Now(),
